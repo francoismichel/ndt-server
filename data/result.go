@@ -70,3 +70,5 @@ type NDT7Result struct {
 	Upload   *model.ArchivalData `json:",omitempty"`
 	Download *model.ArchivalData `json:",omitempty"`
 }
+
+type NDTQUICResult = NDT7Result

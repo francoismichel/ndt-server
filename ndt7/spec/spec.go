@@ -64,4 +64,10 @@ const (
 
 	// SubtestUpload is a upload subtest
 	SubtestUpload = SubtestKind("upload")
+	
+	// SubtestDownloadQUIC is a QUIC download subtest
+	SubtestDownloadQUIC = SubtestKind("downloadQUIC")
+
+	// SubtestUploadQUIC is a QUIC upload subtest
+	SubtestUploadQUIC = SubtestKind("uploadQUIC")
 )

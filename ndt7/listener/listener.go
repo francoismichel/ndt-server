@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	"github.com/m-lab/ndt-server/netx"
+	"github.com/marten-seemann/webtransport-go"
 )
 
 var logFatalf = log.Fatalf
@@ -61,6 +62,20 @@ func serveTLS(server *http.Server, listener net.Listener, certFile, keyFile stri
 		logFatalf("Error, server %v closed with unexpected error %v", server, err)
 	}
 }
+
+// ListenAndServeH3Async starts an https server. The server will run until
+// Shutdown() or Close() is called, but this function will return once the
+// listening socket is established.  This means that when this function
+// returns, the server is immediately available for an https GET to be run
+// against it.
+//
+// Returns a non-nil error if the listening socket can't be established. Logs a
+// fatal error if the server dies for a reason besides ErrServerClosed.
+func ListenAndServeH3Async(server *webtransport.Server) error {
+	go server.ListenAndServe()
+	return nil
+}
+
 
 // ListenAndServeTLSAsync starts an https server. The server will run until
 // Shutdown() or Close() is called, but this function will return once the

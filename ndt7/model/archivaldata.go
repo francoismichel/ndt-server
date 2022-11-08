@@ -27,6 +27,7 @@ type Measurement struct {
 	ConnectionInfo *ConnectionInfo `json:",omitempty"`
 	BBRInfo        *BBRInfo        `json:",omitempty"`
 	TCPInfo        *TCPInfo        `json:",omitempty"`
+	QUICInfo       *QUICInfo       `json:",omitempty"`
 }
 
 // AppInfo contains an application level measurement. This structure is
@@ -56,5 +57,13 @@ type BBRInfo struct {
 // structure is described in the ndt7 specification.
 type TCPInfo struct {
 	tcp.LinuxTCPInfo
+	ElapsedTime int64
+}
+
+// The TCPInfo struct contains information measured using TCP_INFO. This
+// structure is described in the ndt7 specification.
+type QUICInfo struct {
+	// TODO
+	QUICStreamBytesReceived int64
 	ElapsedTime int64
 }

@@ -3,6 +3,7 @@ package sender
 
 import (
 	"context"
+	"encoding/json"
 	"math/rand"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/m-lab/ndt-server/ndt7/model"
 	"github.com/m-lab/ndt-server/ndt7/ping"
 	"github.com/m-lab/ndt-server/ndt7/spec"
+	"github.com/marten-seemann/webtransport-go"
 )
 
 func makePreparedMessage(size int) (*websocket.PreparedMessage, error) {
@@ -23,6 +25,16 @@ func makePreparedMessage(size int) (*websocket.PreparedMessage, error) {
 		return nil, err
 	}
 	return websocket.NewPreparedMessage(websocket.BinaryMessage, data)
+}
+
+func makeWebTransportMessage(size int) ([]byte, error) {
+
+	data := make([]byte, size)
+	_, err := rand.Read(data)
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
 }
 
 // Start sends binary messages (bulk download) and measurement messages (status
@@ -116,6 +128,129 @@ func Start(ctx context.Context, conn *websocket.Conn, data *model.ArchivalData) 
 			preparedMessage, err = makePreparedMessage(bulkMessageSize)
 			if err != nil {
 				logging.Logger.WithError(err).Warn("sender: makePreparedMessage failed")
+				ndt7metrics.ClientSenderErrors.WithLabelValues(
+					proto, string(spec.SubtestDownload), "make-prepared-message").Inc()
+				return err
+			}
+		}
+	}
+}
+
+
+func writeJSON(str webtransport.SendStream, v interface{}) error {
+	err1 := json.NewEncoder(str).Encode(v)
+	return err1
+}
+
+
+// Start sends binary messages (bulk download) and measurement messages (status
+// messages) to the client conn. Each measurement message will also be saved to
+// data.
+//
+// Liveness guarantee: the sender will not be stuck sending for more than the
+// MaxRuntime of the subtest. This is enforced by setting the write deadline to
+// Time.Now() + MaxRuntime.
+func StartWebTransport(ctx context.Context, sess *webtransport.Session, data *model.ArchivalData, mr *measurer.WebTransportMeasurer) error {
+	logging.Logger.Debug("sender: start")
+	// proto := ndt7metrics.ConnLabel(conn)
+	proto := "ndt+webtransport"
+
+	// Start collecting connection measurements. Measurements will be sent to
+	// src until DefaultRuntime, when the src channel is closed.
+	src := mr.Start(ctx, spec.DefaultRuntime)
+	defer logging.Logger.Debug("sender: stop")
+	defer mr.Stop(src)
+
+	logging.Logger.Debug("sender: generating random buffer")
+	bulkMessageSize := 1 << 13
+	bulkDataToSend, err := makeWebTransportMessage(bulkMessageSize)
+	if err != nil {
+		logging.Logger.WithError(err).Warn("sender: bulkDataToSend failed")
+		ndt7metrics.ClientSenderErrors.WithLabelValues(
+			proto, string(spec.SubtestDownload), "make-prepared-message").Inc()
+		return err
+	}
+	deadline := time.Now().Add(spec.MaxRuntime)
+	str, err := sess.OpenUniStream()
+	if err != nil {
+		logging.Logger.WithError(err).Warn("sender: sess.OpenUniStream failed")
+		ndt7metrics.ClientSenderErrors.WithLabelValues(
+			proto, string(spec.SubtestDownload), "open-uni-stream").Inc()
+		return err
+	}
+	
+	err = str.SetWriteDeadline(deadline) // Liveness!
+	if err != nil {
+		logging.Logger.WithError(err).Warn("sender: str.SetWriteDeadline failed")
+		ndt7metrics.ClientSenderErrors.WithLabelValues(
+			proto, string(spec.SubtestDownload), "str-set-write-deadline").Inc()
+		return err
+	}
+
+	// Record measurement start time, and prepare recording of the endtime on return.
+	data.StartTime = time.Now().UTC()
+	defer func() {
+		data.EndTime = time.Now().UTC()
+	}()
+	var totalSent int64
+	for {
+		select {
+		case m, ok := <-src:
+			if !ok { // This means that the measurer has terminated
+				str.Close()
+				ndt7metrics.ClientSenderErrors.WithLabelValues(
+					proto, string(spec.SubtestDownload), "measurer-closed").Inc()
+				return nil
+			}
+			// TODO: write JSON on another stream
+			if err := writeJSON(str, m); err != nil {
+				logging.Logger.WithError(err).Warn("sender: conn.WriteJSON failed")
+				ndt7metrics.ClientSenderErrors.WithLabelValues(
+					proto, string(spec.SubtestDownload), "write-json").Inc()
+				return err
+			}
+			// Only save measurements sent to the client.
+			data.ServerMeasurements = append(data.ServerMeasurements, m)
+			if err := ping.SendTicksWebTransport(sess, deadline); err != nil {
+				logging.Logger.WithError(err).Warn("sender: ping.SendTicks failed")
+				ndt7metrics.ClientSenderErrors.WithLabelValues(
+					proto, string(spec.SubtestDownload), "ping-send-ticks").Inc()
+				return err
+			}
+		default:
+			// if err := conn.WritePreparedMessage(preparedMessage); err != nil {
+			// 	logging.Logger.WithError(err).Warn(
+			// 		"sender: conn.WritePreparedMessage failed")
+			// 	ndt7metrics.ClientSenderErrors.WithLabelValues(
+			// 		proto, string(spec.SubtestDownload), "write-prepared-message").Inc()
+			// 	return err
+			// }
+			
+			if n, err := str.Write(bulkDataToSend); err != nil || n != bulkMessageSize {
+				logging.Logger.WithError(err).Warn(
+					"sender: conn.WritePreparedMessage failed")
+				ndt7metrics.ClientSenderErrors.WithLabelValues(
+					proto, string(spec.SubtestDownload), "write-prepared-message").Inc()
+				return err
+			}
+			// The following block of code implements the scaling of message size
+			// as recommended in the spec's appendix. We're not accounting for the
+			// size of JSON messages because that is small compared to the bulk
+			// message size. The net effect is slightly slowing down the scaling,
+			// but this is currently fine. We need to gather data from large
+			// scale deployments of this algorithm anyway, so there's no point
+			// in engaging in fine grained calibration before knowing.
+			totalSent += int64(bulkMessageSize)
+			if int64(bulkMessageSize) >= spec.MaxScaledMessageSize {
+				continue // No further scaling is required
+			}
+			if int64(bulkMessageSize) > totalSent/spec.ScalingFraction {
+				continue // message size still too big compared to sent data
+			}
+			bulkMessageSize *= 2
+			bulkDataToSend, err = makeWebTransportMessage(bulkMessageSize)
+			if err != nil {
+				logging.Logger.WithError(err).Warn("sender: bulkDataToSend failed")
 				ndt7metrics.ClientSenderErrors.WithLabelValues(
 					proto, string(spec.SubtestDownload), "make-prepared-message").Inc()
 				return err

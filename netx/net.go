@@ -185,6 +185,21 @@ func ToTCPAddr(addr net.Addr) *net.TCPAddr {
 	}
 }
 
+// ToUDPAddr is a helper function for extracting the net.TCPAddr type from a
+// net.Addr of various origins. ToTCPAddr returns nil if addr does not contain a
+// *net.UDPAddr.
+func ToUDPAddr(addr net.Addr) *net.UDPAddr {
+	switch a := addr.(type) {
+	case *Addr:
+		return a.Addr.(*net.UDPAddr)
+	case *net.UDPAddr:
+		return a
+	default:
+		log.Printf("unsupported conn type: %T", a)
+		return nil
+	}
+}
+
 // ToConnInfo is a helper function for extracting the ConnInfo interface from
 // the net.Conn of various origins. ToConnInfo panics if conn does not contain a
 // type supporting ConnInfo.

@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -26,13 +27,17 @@ import (
 	"github.com/m-lab/ndt-server/ndt7/spec"
 	"github.com/m-lab/ndt-server/platformx"
 	"github.com/m-lab/ndt-server/version"
+	"github.com/marten-seemann/webtransport-go"
 
+	"github.com/lucas-clemente/quic-go/http3"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
 var (
 	// Flags that can be passed in on the command line
+	ndtQUICAddr       = flag.String("ndtquic_addr", ":4443", "The address and port to use for the ndtQUIC test")
+	ndtQUICKeylogFile = flag.String("ndtquic_keyog_file", "", "the file to write keylogs in")
 	ndt7Addr          = flag.String("ndt7_addr", ":443", "The address and port to use for the ndt7 test")
 	ndt7AddrCleartext = flag.String("ndt7_addr_cleartext", ":80", "The address and port to use for the ndt7 cleartext test")
 	ndt5Addr          = flag.String("ndt5_addr", ":3001", "The address and port to use for the unencrypted ndt5 test")
@@ -48,6 +53,7 @@ var (
 	tokenVerifyKey    = flagx.FileBytesArray{}
 	tokenRequired5    bool
 	tokenRequired7    bool
+	tokenRequiredQUIC bool
 	isLameDuck        bool
 	tokenMachine      string
 
@@ -65,6 +71,7 @@ func init() {
 	flag.Var(&tokenVerifyKey, "token.verify-key", "Public key for verifying access tokens")
 	flag.BoolVar(&tokenRequired5, "ndt5.token.required", false, "Require access token in NDT5 requests")
 	flag.BoolVar(&tokenRequired7, "ndt7.token.required", false, "Require access token in NDT7 requests")
+	flag.BoolVar(&tokenRequiredQUIC, "ndtQUIC.token.required", false, "Require access token in NDTQUIC requests")
 	flag.StringVar(&tokenMachine, "token.machine", "", "Use given machine name to verify token claims")
 	flag.Var(&deploymentLabels, "label", "Labels to identify the type of deployment.")
 }
@@ -126,6 +133,46 @@ func httpServer(addr string, handler http.Handler) *http.Server {
 		ReadTimeout:  time.Minute,
 		WriteTimeout: time.Minute,
 	}
+}
+
+func http3WebTransportServer(addr string, handler http.Handler, certFile string, keyFile string) (*webtransport.Server, error) {
+
+	var keyLog io.Writer
+	if len(*ndtQUICKeylogFile) > 0 {
+		f, err := os.Create(*ndtQUICKeylogFile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		keyLog = f
+	}
+
+	var err error
+	certs := make([]tls.Certificate, 1)
+	certs[0], err = tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, err
+	}
+	// We currently only use the cert-related stuff from tls.Config,
+	// so we don't need to make a full copy.
+	config := &tls.Config{
+		Certificates: certs,
+		KeyLogWriter: keyLog,
+	}
+	
+
+
+	// create a new webtransport.Server, listening on (UDP) port 443
+	return &webtransport.Server{
+    	H3: http3.Server{
+			Addr:      addr,
+			Handler:   handler,
+			TLSConfig: config,
+	
+			// ReadTimeout
+			// Writetimeout
+		},
+		CheckOrigin: func(r *http.Request) bool { return true },
+	}, nil
 }
 
 // parseDeploymentLabels() returns an array of key-value pairs of type
@@ -206,9 +253,21 @@ func main() {
 		spec.DownloadURLPath: true,
 		spec.UploadURLPath:   true,
 	}
+	// Enforce Tx limits only on downloads.
+	ndtQUICTxPaths := controller.Paths{
+		spec.DownloadURLPath: true,
+	}
+	// Enforce tokens on uploads and downloads.
+	ndtQUICTokenPaths := controller.Paths{
+		spec.DownloadURLPath: true,
+		spec.UploadURLPath:   true,
+	}
 	// NDT5 uses a raw server, which requires tx5. NDT7 is HTTP only.
 	ac5, tx5 := controller.Setup(ctx, v, tokenRequired5, tokenMachine, ndt5Paths, ndt5Paths)
 	ac7, _ := controller.Setup(ctx, v, tokenRequired7, tokenMachine, ndt7TxPaths, ndt7TokenPaths)
+	acQUIC, _ := controller.Setup(ctx, v, tokenRequiredQUIC, tokenMachine, ndtQUICTxPaths, ndtQUICTokenPaths)
+
+	fmt.Printf("acQUIC: %v\n", acQUIC)
 
 	// The ndt5 protocol serving non-HTTP-based tests - forwards to Ws-based
 	// server if the first three bytes are "GET".
@@ -251,6 +310,37 @@ func main() {
 	rtx.Must(listener.ListenAndServeAsync(ndt7ServerCleartext), "Could not start ndt7 cleartext server")
 	defer ndt7ServerCleartext.Close()
 
+	// ndtQUIC
+	// The ndtQUIC listener serving up NDT7 tests, likely on standard ports.
+	ndtQUICMux := http.NewServeMux()
+
+	ndtQUICMux.Handle("/", http.FileServer(http.Dir(*htmlDir)))
+
+
+	ndtQUICServer, err := http3WebTransportServer(
+		*ndtQUICAddr,
+		// acQUIC.Then(logging.MakeAccessLogHandler(ndtQUICMux)),
+		// logging.MakeAccessLogHandler(ndtQUICMux),
+		// acQUIC.Then(ndtQUICMux),
+		ndtQUICMux,
+		*certFile,
+		*keyFile,
+	)
+
+	
+
+	ndtQUICHandler := &handler.QUICHandler{
+		Handler: handler.Handler {
+			DataDir:        *dataDir,
+			SecurePort:     *ndtQUICAddr,
+			ServerMetadata: serverMetadata,
+		},
+		Server: ndtQUICServer,
+	}
+
+	ndtQUICMux.Handle(spec.DownloadURLPath, http.HandlerFunc(ndtQUICHandler.Download))
+	ndtQUICMux.Handle(spec.UploadURLPath, http.HandlerFunc(ndtQUICHandler.Upload))
+
 	// Only start TLS-based services if certs and keys are provided
 	if *certFile != "" && *keyFile != "" {
 		// The ndt5 protocol serving WsS-based tests.
@@ -273,6 +363,12 @@ func main() {
 		log.Println("About to listen for ndt7 tests on " + *ndt7Addr)
 		rtx.Must(listener.ListenAndServeTLSAsync(ndt7Server, *certFile, *keyFile), "Could not start ndt7 server")
 		defer ndt7Server.Close()
+
+		// ndtQUIC
+		log.Println("About to listen for ndtQUIC tests on " + *ndtQUICAddr)
+		rtx.Must(listener.ListenAndServeH3Async(ndtQUICServer), "Could not start ndt7 QUIC server")
+		defer ndtQUICServer.Close()
+
 	} else {
 		log.Printf("Cert=%q and Key=%q means no TLS services will be started.\n", *certFile, *keyFile)
 	}
